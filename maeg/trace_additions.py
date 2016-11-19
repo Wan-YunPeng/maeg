@@ -1,3 +1,4 @@
+# -*- encoding: utf-8 -*-
 from simuvex import SimStatePlugin
 import simuvex
 import claripy

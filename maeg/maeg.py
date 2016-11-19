@@ -1,3 +1,4 @@
+# -*- encoding: utf-8 -*-
 import logging
 
 l = logging.getLogger("maeg.Crash")
@@ -37,7 +38,7 @@ class Crash(object):
         :hooks: dictionary of simprocedure hooks, addresses to simprocedures    
         :format_infos: a list of atoi FormatInfo objects that should be used when analyzing the crash  
         :rop_cache_tuple: a angrop tuple to load from        
-        rop_cache_tuple:angrop——rop gadget finder and chain builder
+        rop_cache_tuple:angrop——rop gadget finder and chain builder     
         :use_rop: whether or not to use rop           
         :explore_steps: number of steps which have already been explored, should only set by exploration methods       
         :angrop_object: an angrop object, should only be set by exploration methods      
@@ -86,16 +87,14 @@ class Crash(object):
         #we assume linux is going to enfore statckbased aslr
         if aslr is None:
         	self.aslr = True
-        else
+        else:
         	self.aslr = aslr
 
         # first explore by the input
         if crash_state is None:
         	# run the tracer, grabbing the crash state
-        	remove_options = {so.TRACK_REGISTER_ACTIONS, so.TRACK_TMP_ACTIONS, so.TRACK_JMP_ACTIONS,
-                              so.ACTION_DEPS, so.TRACK_CONSTRAINT_ACTIONS}
-            add_options = {so.MEMORY_SYMBOLIC_BYTES_MAP, so.TRACK_ACTION_HISTORY, so.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                           so.CONCRETIZE_SYMBOLIC_FILE_READ_SIZES}
+        	remove_options = {so.TRACK_REGISTER_ACTIONS, so.TRACK_TMP_ACTIONS, so.TRACK_JMP_ACTIONS,so.ACTION_DEPS, so.TRACK_CONSTRAINT_ACTIONS}
+            add_options = {so.MEMORY_SYMBOLIC_BYTES_MAP, so.TRACK_ACTION_HISTORY, so.CONCRETIZE_SYMBOLIC_WRITE_SIZES,so.CONCRETIZE_SYMBOLIC_FILE_READ_SIZES}
 
             # use tracer to get path info at crash point.
             self._tracer = tracer.Tracer(binary, input=self.crash, pov_file=self.pov_file, resiliency=False,
