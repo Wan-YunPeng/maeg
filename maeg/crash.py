@@ -67,7 +67,7 @@ class Crash(object):
         	if angrop_object is not None:
         		self.rop = angrop_object
         	else:
-                self.rop = self.project.analyses.ROP()
+                    self.rop = self.project.analyses.ROP()
                 if rop_cache_tuple is not None:
                     l.info("loading rop gadgets from cache tuple")
                     self.rop._load_cache_tuple(rop_cache_tuple)
@@ -92,8 +92,8 @@ class Crash(object):
 
         # first explore by the input
         if crash_state is None:
-        	# run the tracer, grabbing the crash state
-        	remove_options = {so.TRACK_REGISTER_ACTIONS, so.TRACK_TMP_ACTIONS, so.TRACK_JMP_ACTIONS,so.ACTION_DEPS, so.TRACK_CONSTRAINT_ACTIONS}
+            #run the tracer, grabbing the crash state
+            remove_options = {so.TRACK_REGISTER_ACTIONS, so.TRACK_TMP_ACTIONS, so.TRACK_JMP_ACTIONS,so.ACTION_DEPS, so.TRACK_CONSTRAINT_ACTIONS}
             add_options = {so.MEMORY_SYMBOLIC_BYTES_MAP, so.TRACK_ACTION_HISTORY, so.CONCRETIZE_SYMBOLIC_WRITE_SIZES,so.CONCRETIZE_SYMBOLIC_FILE_READ_SIZES}
 
             # use tracer to get path info at crash point.

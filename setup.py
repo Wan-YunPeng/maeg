@@ -4,13 +4,5 @@ import subprocess
 setup(
       name='maeg',
       version='0.01',
-      packages=['maeg'],
-      install_requires=[
-            'angr',
-            'povsim',
-            'simuvex',
-            'tracer',
-            'angrop',
-            'compilerex',
-      ],
+      packages=['maeg','maeg.exploit', 'maeg.exploit.cgc', 'maeg.exploit.cgc.type1', 'maeg.exploit.cgc.type2', 'maeg.exploit.cgc.c_templates', 'maeg.exploit.techniques', 'maeg.exploit.shellcodes'],
 )
