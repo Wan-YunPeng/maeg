@@ -2,6 +2,7 @@
 import logging
 
 l = logging.getLogger("maeg.Crash")
+l.setLevel('DEBUG')
 
 import os
 import angr
@@ -10,6 +11,7 @@ import random
 import tracer
 import hashlib
 import operator
+from analyzer import Analyzer
 from .trace_additions import ChallRespInfo, ZenPlugin
 from maeg.exploit import CannotExploit, CannotExplore, ExploitFactory, CGCExploitFactory
 from maeg.vulnerability import Vulnerability
@@ -44,6 +46,7 @@ class Crash(object):
         :angrop_object: an angrop object, should only be set by exploration methods      
         '''
         # some info from prev path, in order to execute prev path but bypass the crash point.
+        self.analyzer = Analyzer(binary)
         self.binary = binary
         self.crash  = crash
         self.pov_file = pov_file
@@ -143,8 +146,9 @@ class Crash(object):
         # action (in case of a bad write or read) which caused the crash
         self.violating_action = None
 
-        l.debug("traiging crash")
+        l.debug("triaging crash")
         self._triage_crash()
+
 
 
     def _triage_crash(self):
@@ -186,7 +190,7 @@ class Crash(object):
         # if nothing obvious is symbolic let's look at actions
 
         # grab the all actions in the last basic block
-        symbolic_actions = [ ]
+        symbolic_actions = []
         for a in list(self.prev.state.log.actions) + list(self.state.log.actions):
         	# do something on memory and the address of memory is symbolic
             if a.type == 'mem':
@@ -198,9 +202,11 @@ class Crash(object):
         for sym_action in symbolic_actions:
             if sym_action.action == "write":
                 if self.state.se.symbolic(sym_action.data):
+                    # data is symbolic and addr is symbolic
                     l.info("detected write-what-where vulnerability")
                     self.crash_types.append(Vulnerability.WRITE_WHAT_WHERE)
                 else:
+                    # data is not symbolic but addr is symbolic
                     l.info("detected write-x-where vulnerability")
                     self.crash_types.append(Vulnerability.WRITE_X_WHERE)
 
@@ -218,6 +224,54 @@ class Crash(object):
         return
 
 
+    def _symbolic_control(self, st):
+        '''
+        determine the amount of symbolic bits in an ast, useful to determining how much control we have
+        over registers
+        '''
+
+        sbits = 0
+
+        for bitidx in xrange(self.state.arch.bits):
+            if st[bitidx].symbolic:
+                sbits += 1
+
+        return sbits
+
+
+    def explorable(self):
+        '''
+        determine if the crash can be explored with the 'crash explorer'.
+        :return: True if the crash's type lends itself to exploring, only 'arbitrary-read' for now
+        '''
+
+        # TODO add arbitrary receive into this list
+        explorables = [Vulnerability.ARBITRARY_READ, Vulnerability.WRITE_WHAT_WHERE, Vulnerability.WRITE_X_WHERE]
+        #exploitables = [Vulnerability.IP_OVERWRITE, Vulnerability.PARTIAL_IP_OVERWRITE, Vulnerability.BP_OVERWRITE,
+        #        Vulnerability.PARTIAL_BP_OVERWRITE, Vulnerability.WRITE_WHAT_WHERE, Vulnerability.WRITE_X_WHERE]
+
+        return self.one_of(explorables)
+
+    def explore(self, path_file=None):
+        '''
+        explore a crash further to find new bugs
+        '''
+
+        # crash should be classified at this point
+        if not self.explorable():
+                raise CannotExplore("non-explorable crash")
+
+        self._reconstrain_flag_data(self.state)
+        # violating_action is previously found symbolic action
+        assert self.violating_action is not None
+
+        if self.one_of([Vulnerability.ARBITRARY_READ]):
+            self._explore_arbitrary_read(path_file)
+        elif self.one_of([Vulnerability.WRITE_WHAT_WHERE, Vulnerability.WRITE_X_WHERE]):
+            self._explore_arbitrary_write(path_file)
+        else:
+            raise CannotExplore("unknown explorable crash type: %s", self.crash_types)
+
     def exploitable(self):
     	'''
         determine if the crash is exploitable
@@ -227,6 +281,32 @@ class Crash(object):
                 Vulnerability.PARTIAL_BP_OVERWRITE, Vulnerability.WRITE_WHAT_WHERE, Vulnerability.WRITE_X_WHERE]
 
         return self.one_of(exploitables)
+
+    def exploit(self):
+        analysis = self.analyzer.analyze(self.prev)
+        for payload in self.exploiter.generate(self.prev, analysis):
+            if not payload:
+                break
+            if self.verifier.verify(payload):
+                self.payloads.append(payload)
+                l.info('Generated!')
+                return True
+        l.info('Can not generate any payload.')
+        return False
+
+    def save(self, file_name = None):
+        file_name = self.binary + '1' if file_name is None else file_name
+        if len(self.payloads) == 1:
+            ext = 'py' if self.payloads[0].ptype == 'script' else 'exp'
+            self._save(self.payloads[0].content, '%s.%s' % (file_name, ext))
+        else:
+            for i in xrange(len(self.payloads)):
+                ext = 'py' if self.payloads[0].ptype == 'script' else 'exp'
+                self._save(self.payloads[i].content,'%s-%d.%s' % (file_name, i, ext))
+
+    def _save(self, payload, file_name):
+        with open(file_name, 'w') as f:
+            f.write(payload)
 
     def one_of(self, crash_types):
         '''
@@ -238,8 +318,29 @@ class Crash(object):
 
         return bool(len(set(self.crash_types).intersection(set(crash_types))))
 
+    def _reconstrain_flag_data(self, state):
+
+        l.info("reconstraining flag")
+
+        replace_dict = dict()
+        for c in self._tracer.preconstraints:
+            if any([v.startswith('cgc-flag') or v.startswith("random") for v in list(c.variables)]):
+                concrete = next(a for a in c.args if not a.symbolic)
+                symbolic = next(a for a in c.args if a.symbolic)
+                replace_dict[symbolic.cache_key] = concrete
+        cons = state.se.constraints
+        new_cons = []
+        for c in cons:
+            new_c = c.replace_dict(replace_dict)
+            new_cons.append(new_c)
+        state.release_plugin("solver_engine")
+        state.add_constraints(*new_cons)
+        state.downsize()
+        state.se.simplify()
+
     @staticmethod
     def _segment(memory_writes):
+        # symblic addr and the length
         segments = { }
         memory_writes = sorted(memory_writes)
 
@@ -270,4 +371,115 @@ class Crash(object):
         segments[current_w_start] = current_w_end - current_w_start
 
         return segments
+
+    def _explore_arbitrary_read(self, path_file=None):
+        # crash type was an arbitrary-read, let's point the violating address at a
+        # symbolic memory region
+        # symbolic_mem is the result of segment user_write : addr : len
+        largest_regions = sorted(self.symbolic_mem.items(),
+                key=operator.itemgetter(1),
+                reverse=True)
+
+        min_read = self.state.se.min(self.violating_action.addr)
+        max_read = self.state.se.max(self.violating_action.addr)
+
+        largest_regions = map(operator.itemgetter(0), largest_regions)
+        # filter addresses which fit between the min and max possible address
+        largest_regions = filter(lambda x: (min_read <= x) and (x <= max_read), largest_regions)
+
+        # populate the rest of the list with addresses from the binary
+        min_addr = self.project.loader.main_bin.get_min_addr()
+        max_addr = self.project.loader.main_bin.get_max_addr()
+        pages = range(min_addr, max_addr, 0x1000)
+        pages = filter(lambda x: (min_read <= x) and (x <= max_read), pages)
+
+        read_addr = None
+        constraint = None
+        for addr in largest_regions + pages:
+            read_addr = addr
+            constraint = self.violating_action.addr == addr
+
+            if self.state.se.satisfiable(extra_constraints=(constraint,)):
+                break
+
+            constraint = None
+
+        if constraint is None:
+            raise CannotExploit("unable to find suitable read address, cannot explore")
+
+        self.state.add_constraints(constraint)
+        # find where to read
+        l.debug("constraining input to read from address %#x", read_addr)
+
+        l.info("starting a new crash exploration phase based off the crash at address 0x%x", self.violating_action.ins_addr)
+
+        new_input = ChallRespInfo.atoi_dumps(self.state)
+        if path_file is not None:
+            l.info("dumping new crash evading input into file '%s'", path_file)
+            with open(path_file, 'w') as f:
+                f.write(new_input)
+
+        # create a new crash object starting here
+        use_rop = False if self.rop is None else True
+        self.__init__(self.binary,
+                new_input,
+                explore_steps=self.explore_steps + 1,
+                constrained_addrs=self.constrained_addrs + [self.violating_action],
+                use_rop=use_rop,
+                angrop_object=self.rop)
+
+
+    def _explore_arbitrary_write(self, path_file=None):
+        # crash type was an arbitrary-write, this routine doesn't care about taking advantage
+        # of the write it just wants to try to find a more valuable crash by pointing the write
+        # at some writable memory
+
+        # find a writable data segment
+
+        elf_objects = self.project.loader.all_elf_objects
+
+        assert len(elf_objects) > 0, "target binary is not ELF or CGC, unsupported by rex"
+
+        min_write = self.state.se.min(self.violating_action.addr)
+        max_write = self.state.se.max(self.violating_action.addr)
+
+        segs = [ ]
+        for eobj in elf_objects:
+            segs.extend(filter(lambda s: s.is_writable, eobj.segments))
+        # 
+        segs = filter(lambda s: (s.min_addr <= max_write) and (s.max_addr >= min_write), segs)
+
+        write_addr = None
+        constraint = None
+        for seg in segs:
+            for page in range(seg.min_addr, seg.max_addr, 0x1000):
+                write_addr = page
+                constraint = self.violating_action.addr == page
+
+                if self.state.se.satisfiable(extra_constraints=(constraint,)):
+                    break
+
+                constraint = None
+
+        if constraint is None:
+            raise CannotExploit("Cannot point write at any writeable segments")
+
+        self.state.add_constraints(constraint)
+        l.debug("constraining input to write to address %#x", write_addr)
+
+        l.info("starting a new crash exploration phase based off the crash at address %#x",
+                self.violating_action.ins_addr)
+        new_input = ChallRespInfo.atoi_dumps(self.state)
+        if path_file is not None:
+            l.info("dumping new crash evading input into file '%s'", path_file)
+            with open(path_file, 'w') as f:
+                f.write(new_input)
+
+        use_rop = False if self.rop is None else True
+        self.__init__(self.binary,
+                new_input,
+                explore_steps=self.explore_steps + 1,
+                constrained_addrs=self.constrained_addrs + [self.violating_action],
+                use_rop=use_rop,
+                angrop_object=self.rop)
 
